@@ -400,6 +400,63 @@ class ShapeResponse(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# Three-way merge against a common base
+# ---------------------------------------------------------------------------
+
+
+class MergeRequest(BaseModel):
+    base: Any = Field(
+        ..., description="The common ancestor JSON document both edit lines "
+        "diverged from."
+    )
+    left: Any = Field(..., description="One edit line derived from `base`.")
+    right: Any = Field(..., description="The other edit line derived from `base`.")
+
+
+class MergeConflictSide(BaseModel):
+    present: bool = Field(
+        ...,
+        description=(
+            "Whether this side has a value at the conflicted path. `false` "
+            "means the member is absent on that side — distinct from an "
+            "explicit JSON null, which is `present: true` with value null."
+        ),
+    )
+    value: Optional[Any] = Field(
+        None, description="This side's value at the path; null when absent."
+    )
+
+
+class MergeConflict(BaseModel):
+    path: str = Field(
+        ..., description="RFC 6901 pointer of the conflicted value "
+        "('' is the document root)."
+    )
+    base: MergeConflictSide
+    left: MergeConflictSide
+    right: MergeConflictSide
+
+
+class MergeResponse(BaseModel):
+    merged: Optional[Any] = Field(
+        None,
+        description=(
+            "The recursively merged document. Present exactly when "
+            "`conflicts` is empty; omitted entirely when any conflict "
+            "exists — a conflicting merge never returns a partial document."
+        ),
+    )
+    conflicts: List[MergeConflict] = Field(
+        ...,
+        description=(
+            "Every path both sides changed differently (including a "
+            "deletion racing a modification), sorted by RFC 6901 pointer. "
+            "Empty when the merge succeeded."
+        ),
+    )
+
+
 class CompactVerifyResponse(StandardVerifyResponse):
     proofMode: Literal["compact"]
 
@@ -481,6 +538,10 @@ def install_openapi(app: FastAPI) -> None:
                 ShapeRequest,
                 ShapeNodeModel,
                 ShapeResponse,
+                MergeRequest,
+                MergeConflictSide,
+                MergeConflict,
+                MergeResponse,
                 ErrorResponse,
             )
         )
@@ -904,6 +965,87 @@ def install_openapi(app: FastAPI) -> None:
                                     {"path": "/subject/name",
                                      "type": "string"},
                                 ],
+                            },
+                        ),
+                    },
+                    **error_responses,
+                },
+            }
+        }
+
+        generated["paths"]["/merge"] = {
+            "post": {
+                "summary": "Three-way merge of two edit lines against a "
+                "common base",
+                "description": (
+                    "Merges `left` and `right` — two documents that both "
+                    "diverged from the shared ancestor `base` — by "
+                    "recursively merging object members. A value changed on "
+                    "only one side takes that side; a value changed on both "
+                    "sides to the same canonical JSON value takes that "
+                    "value; values that are objects on all three sides are "
+                    "merged member by member over the union of their keys. "
+                    "Arrays are atomic values and never merged "
+                    "element-wise; a missing member is distinct from an "
+                    "explicit null; canonical comparison keeps 1 and 1.0 "
+                    "distinct. When both sides changed the same path "
+                    "differently — including a deletion racing a "
+                    "modification — the path conflicts: the response then "
+                    "carries every conflict sorted by RFC 6901 pointer, "
+                    "each with the presence marker and value of all three "
+                    "sides, and no partial `merged` document. With no "
+                    "conflicts the response carries the merged document "
+                    "and an empty `conflicts` array."
+                ),
+                "operationId": "merge",
+                "requestBody": _json_content(
+                    _ref("MergeRequest"),
+                    example={
+                        "base": {
+                            "subject": {"name": "Ada", "age": 36},
+                            "tags": ["math"],
+                            "role": None,
+                        },
+                        "left": {
+                            "subject": {"name": "Ada", "age": 37},
+                            "tags": ["math", "computing"],
+                        },
+                        "right": {
+                            "subject": {"name": "Ada Lovelace"},
+                            "tags": ["math", "poetry"],
+                            "role": None,
+                        },
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": "Merged document, or every conflict "
+                        "when the edit lines cannot be reconciled.",
+                        **_json_content(
+                            _ref("MergeResponse"),
+                            example={
+                                "conflicts": [
+                                    {
+                                        "path": "/subject/age",
+                                        "base": {"present": True,
+                                                 "value": 36},
+                                        "left": {"present": True,
+                                                 "value": 37},
+                                        "right": {"present": False,
+                                                  "value": None},
+                                    },
+                                    {
+                                        "path": "/tags",
+                                        "base": {"present": True,
+                                                 "value": ["math"]},
+                                        "left": {"present": True,
+                                                 "value": ["math",
+                                                           "computing"]},
+                                        "right": {"present": True,
+                                                  "value": ["math",
+                                                            "poetry"]},
+                                    },
+                                ]
                             },
                         ),
                     },

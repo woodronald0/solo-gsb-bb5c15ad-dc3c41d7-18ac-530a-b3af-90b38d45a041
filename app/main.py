@@ -23,6 +23,11 @@ POST /shape    return the value-free structural manifest of a document
                (every node's RFC 6901 path and JSON type) plus a bottom-up
                shapeHash, so callers can compare two documents for shape
                equality without exchanging payloads.
+POST /merge    three-way merge of two edit lines (left, right) that diverged
+               from a common base document; object members are merged
+               recursively, arrays are atomic values, and paths both sides
+               changed differently are reported as conflicts (no partial
+               merge is returned).
 GET  /healthz  liveness probe.
 GET  /         service metadata.
 """
@@ -56,6 +61,7 @@ from .errors import (
     ROOT_MISMATCH,
 )
 from .jsonio import parse_json_strict
+from .merge import merge_documents
 from .openapi import install_openapi
 from .tree import (
     CompactNode,
@@ -88,7 +94,7 @@ _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 app = FastAPI(
     title="Selective JSON Disclosure",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "Commit a nested JSON document to a reproducible Merkle root and "
         "disclose individual RFC 6901 leaf facts with inclusion proofs.\n\n"
@@ -526,6 +532,31 @@ async def shape_document_endpoint(request: Request) -> Dict[str, Any]:
     validate_json_value(document, loc="document")
 
     return shape_manifest(document)
+
+
+# ---------------------------------------------------------------------------
+# POST /merge
+# ---------------------------------------------------------------------------
+
+
+@app.post("/merge")
+async def merge_documents_endpoint(request: Request) -> Dict[str, Any]:
+    body = await _read_json_body(request)
+    if not isinstance(body, dict):
+        raise ApiError(
+            INVALID_REQUEST,
+            "request body must be a JSON object",
+            loc="body",
+        )
+
+    base = _get_field(body, "base", "base")
+    validate_json_value(base, loc="base")
+    left = _get_field(body, "left", "left")
+    validate_json_value(left, loc="left")
+    right = _get_field(body, "right", "right")
+    validate_json_value(right, loc="right")
+
+    return merge_documents(base, left, right)
 
 
 # ---------------------------------------------------------------------------
@@ -1034,7 +1065,7 @@ async def healthz() -> Dict[str, str]:
 async def index() -> Dict[str, Any]:
     return {
         "service": "selective-json-disclosure",
-        "version": "1.5.0",
+        "version": "1.6.0",
         "endpoints": {
             "commit": "POST /commit",
             "verify": "POST /verify",
@@ -1042,6 +1073,7 @@ async def index() -> Dict[str, Any]:
             "patch": "POST /patch",
             "redact": "POST /redact",
             "shape": "POST /shape",
+            "merge": "POST /merge",
             "docs": "GET /docs",
             "health": "GET /healthz",
         },

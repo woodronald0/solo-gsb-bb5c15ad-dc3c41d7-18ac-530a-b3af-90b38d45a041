@@ -354,6 +354,61 @@ array       0x17 || u32be(元素数) || 子节点哈希*                  （保
 把 `36` 改成 `41`、`"Ada"` 改成 `"Bob"` 后 `shapeHash` 不变；把 `36` 改成 `"36"`
 （数字变字符串）或把 `"empty": {}` 改成 `[]`，`shapeHash` 即改变。
 
+### 11. 三方合并（`POST /merge`）
+
+`/merge` 接收 `base`、`left`、`right` 三份 JSON 文档：`base` 是共同祖先版本，
+`left` 与 `right` 是从它分出的两路编辑。服务按**对象成员递归**地做三方合并：
+
+- 仅一侧相对 `base` 改动的值 → 采用该侧（另一侧未动）；
+- 两侧改成**同一规范 JSON 值** → 采用该值（同一编辑只做一次）；
+- 三侧都是对象的值 → 对三者键的并集逐成员递归合并；
+- 其余情况——两侧对同一路径做了**不同**改动（含**删除与修改并发**）→ 记为冲突。
+
+比较规则与服务其他接口一致：
+
+- 相等性按**规范 JSON 字节**判定：`1` 与 `1.0`、`true` 与 `1` 都是不同的值；
+- **数组成员缺失与 `null` 必须区分**：成员不存在（`present: false`）不等于
+  成员为 `null`（`present: true`、`value: null`）；
+- **数组整体视为一个值**：不做逐元素合并，两侧对同一数组的任何不同改动
+  都使整个数组成为一个冲突。
+
+响应只有两种形态（HTTP 均为 `200`）：
+
+- 无冲突：`{"merged": <合并后的文档>, "conflicts": []}`；
+- 有冲突：`{"conflicts": [...]}`——**不返回任何部分合并文档**（响应中没有
+  `merged` 字段）。`conflicts` 按 RFC 6901 路径字符串排序，每条给出三侧的
+  **存在标记和值**：
+
+```json
+{
+  "conflicts": [
+    {
+      "path": "/subject/age",
+      "base":  {"present": true,  "value": 36},
+      "left":  {"present": true,  "value": 37},
+      "right": {"present": false, "value": null}
+    }
+  ]
+}
+```
+
+删除整个子树与修改子树内部成员的并发，在**子树根路径**上报告一条冲突
+（而不是在嵌套叶上）；根标量两侧分叉时冲突路径为空指针 `""`。
+
+请求：
+
+```json
+{
+  "base":  {"subject": {"name": "Ada", "age": 36}, "tags": ["math"], "role": null},
+  "left":  {"subject": {"name": "Ada", "age": 37}, "tags": ["math", "computing"]},
+  "right": {"subject": {"name": "Ada Lovelace"}, "tags": ["math", "poetry"], "role": null}
+}
+```
+
+上例中 `/subject/name`（仅 right 改）与 `/role`（仅 left 删）可合并，
+但 `/subject/age`（left 改、right 删）与 `/tags`（两侧改成不同数组）冲突，
+因此响应只含按路径排序的 `conflicts`（`/subject/age`、`/tags`），不含 `merged`。
+
 ## API
 
 所有请求/响应均为 JSON。错误响应统一形如：
@@ -654,6 +709,7 @@ array       0x17 || u32be(元素数) || 子节点哈希*                  （保
 - `POST /patch` → 顺序执行 RFC 6902 add/remove/replace 补丁，返回 patched 文档与 changedPaths
 - `POST /redact` → 按 RFC 6901 片段（字面量/`*`/`**`）确定性 mask/drop 叶路径，返回 redacted 文档与 applied 列表
 - `POST /shape` → 不含叶值的结构清单（路径+类型）与自底向上同形哈希 `shapeHash`
+- `POST /merge` → 相对共同 base 的三方合并；无冲突返回 merged 文档，有冲突按 RFC 6901 路径排序返回全部 conflicts（不含部分合并结果）
 - `GET /` → 服务与端点元信息
 - `GET /docs` / `GET /openapi.json` → OpenAPI 文档
 
@@ -717,6 +773,15 @@ curl -s localhost:8000/shape -H 'content-type: application/json' -d '{
   "document": {"subject": {"name": "Bob", "age": 41}, "emails": ["c@z", "d@w"]}
 }'
 # 两次响应的 shapeHash 相同；把 41 改成 "41"（字符串）再请求，哈希即改变
+
+# 8) 三方合并：两路编辑相对共同 base 合并；有冲突时只返回 conflicts
+curl -s localhost:8000/merge -H 'content-type: application/json' -d '{
+  "base":  {"subject": {"name": "Ada", "age": 36}, "tags": ["math"]},
+  "left":  {"subject": {"name": "Ada", "age": 37}, "tags": ["math", "computing"]},
+  "right": {"subject": {"name": "Ada Lovelace", "age": 36}, "tags": ["math"]}
+}'
+# => {"merged": {"subject": {"age": 37, "name": "Ada Lovelace"},
+#                 "tags": ["math", "computing"]}, "conflicts": []}
 ```
 
 ## 本地开发与测试（不使用 Docker）
@@ -731,17 +796,18 @@ python3 -m uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、/redact、/shape、错误处理
+  main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、/redact、/shape、/merge、错误处理
   diff.py        # 叶级路径对齐、规范值指纹与 added/removed/changed
   patch.py       # RFC 6902 add/remove/replace 引擎（有序执行、整体校验、changedPaths）
   redact.py      # 叶级脱敏引擎：RFC 6901 片段（字面量/*/**）匹配、mask/drop、规则优先级
   shape.py       # 结构清单与自底向上同形哈希（域标签 + 长度前缀，标量值不参与）
+  merge.py       # 相对共同 base 的三方合并：对象成员递归、数组原子、冲突收集
   tree.py        # 叶展开、叶哈希/节点哈希、排序建树、标准与紧凑证明
   pointers.py    # RFC 6901 指针解析与寻址
   canonical.py   # 规范 JSON 序列化
   jsonio.py      # 严格 JSON 解析（拒绝重复键、错误定位）
   validation.py  # 提交值校验（非有限数、非 JSON 类型等）
-  openapi.py     # 两种证明格式与 /diff、/patch 的 OpenAPI 模型与文档合并
+  openapi.py     # 两种证明格式与 /diff、/patch、/redact、/shape、/merge 的 OpenAPI 模型与文档合并
   errors.py      # 带 code/loc 的 API 错误类型
 tests/           # 哈希/树单元测试 + API 端到端（含全部篡改、去重、结构错误与补丁场景）
 Dockerfile
