@@ -1,11 +1,12 @@
-"""Hand-written OpenAPI surface for the /commit and /verify endpoints.
+"""Hand-written OpenAPI surface for every route.
 
-Both routes deliberately accept a raw JSON :class:`fastapi.Request` (so they
+All routes deliberately accept a raw JSON :class:`fastapi.Request` (so they
 can return the documented precise ``loc`` errors instead of Pydantic 422s),
 which means FastAPI cannot infer their schemas automatically.  The Pydantic
-models below describe the wire contract — including the two proof formats —
-and :func:`install_openapi` merges them into the generated document while
-keeping the auto-generated metadata for the health/index routes.
+models below describe the wire contract — including the two proof formats
+and the /merge success/conflict responses — and :func:`install_openapi`
+merges them into the generated document while keeping the auto-generated
+metadata for the health/index routes.
 """
 
 from __future__ import annotations
@@ -404,6 +405,77 @@ class CompactVerifyResponse(StandardVerifyResponse):
     proofMode: Literal["compact"]
 
 
+# ---------------------------------------------------------------------------
+# Three-way document merge
+# ---------------------------------------------------------------------------
+
+
+class MergeRequest(BaseModel):
+    base: Any = Field(
+        ...,
+        description=(
+            "The common ancestor JSON document that both sides branched "
+            "from."
+        ),
+    )
+    left: Any = Field(..., description="The first edited JSON document.")
+    right: Any = Field(..., description="The second edited JSON document.")
+
+
+class MergeSide(BaseModel):
+    present: bool = Field(
+        ...,
+        description=(
+            "Whether the path exists on this side. A missing member "
+            "(present=false) is distinct from a present JSON null value."
+        ),
+    )
+    value: Optional[Any] = Field(
+        None,
+        description=(
+            "The value on this side; null is used for the value when "
+            "present=true and the value itself is null, and also when "
+            "present=false (check `present` to distinguish the two)."
+        ),
+    )
+
+
+class MergeConflict(BaseModel):
+    path: str = Field(
+        ...,
+        description=(
+            "RFC 6901 pointer of the divergent path ('' for the whole "
+            "document)."
+        ),
+    )
+    base: MergeSide = Field(..., description="The base side at `path`.")
+    left: MergeSide = Field(..., description="The left side at `path`.")
+    right: MergeSide = Field(..., description="The right side at `path`.")
+
+
+class MergeSuccessResponse(BaseModel):
+    merged: Any = Field(
+        ...,
+        description=(
+            "The merged JSON document. Arrays are treated as a single value "
+            "rather than element-wise merged; present null is distinct from "
+            "a missing member, and canonical JSON equality decides whether "
+            "both sides agreed (so 1 and 1.0 are different edits)."
+        ),
+    )
+
+
+class MergeConflictResponse(BaseModel):
+    conflicts: List[MergeConflict] = Field(
+        ...,
+        description=(
+            "Every divergent RFC 6901 path, sorted by pointer. When "
+            "non-empty no partial merged document is returned. Each entry "
+            "gives all three sides' presence flags and values."
+        ),
+    )
+
+
 class ErrorDetail(BaseModel):
     code: str
     message: str
@@ -481,6 +553,11 @@ def install_openapi(app: FastAPI) -> None:
                 ShapeRequest,
                 ShapeNodeModel,
                 ShapeResponse,
+                MergeRequest,
+                MergeSide,
+                MergeConflict,
+                MergeSuccessResponse,
+                MergeConflictResponse,
                 ErrorResponse,
             )
         )
@@ -904,6 +981,91 @@ def install_openapi(app: FastAPI) -> None:
                                     {"path": "/subject/name",
                                      "type": "string"},
                                 ],
+                            },
+                        ),
+                    },
+                    **error_responses,
+                },
+            }
+        }
+
+        generated["paths"]["/merge"] = {
+            "post": {
+                "summary": "Three-way merge two edits branched from one base",
+                "description": (
+                    "Merges `left` and `right`, both edited from the common "
+                    "`base`, by descending object members and addressing "
+                    "every slot as an RFC 6901 path. A slot changed on only "
+                    "one side takes that side's value (a deletion included), "
+                    "and slots both sides changed to the same canonical JSON "
+                    "value take that value. Arrays are never split: the "
+                    "whole array is one value, so concurrent element edits "
+                    "conflict. Equality is canonical: a missing member is "
+                    "not null and 1 is not 1.0 (nor true). Divergent edits "
+                    "at the same path — delete vs modify included — are "
+                    "reported as conflicts sorted by RFC 6901 pointer, each "
+                    "with every side's presence flag and value; when any "
+                    "conflict exists the response carries no partial merged "
+                    "document."
+                ),
+                "operationId": "merge",
+                "requestBody": _json_content(
+                    _ref("MergeRequest"),
+                    example={
+                        "base": {
+                            "subject": {"name": "Ada", "age": 36},
+                            "tags": ["a", "b"],
+                            "role": "analyst",
+                        },
+                        "left": {
+                            "subject": {"name": "Ada", "age": 37},
+                            "tags": ["a", "b", "z"],
+                            "role": "owner",
+                            "team": "engine",
+                        },
+                        "right": {
+                            "subject": {"name": "Ada", "age": 36},
+                            "tags": ["a", "c"],
+                            "team": "engine",
+                        },
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": (
+                            "Either the merged document (`merged`) or, when "
+                            "the edits cannot be reconciled, the complete "
+                            "path-sorted `conflicts` list with no merged "
+                            "document."
+                        ),
+                        **_json_content(
+                            {
+                                "oneOf": [
+                                    _ref("MergeSuccessResponse"),
+                                    _ref("MergeConflictResponse"),
+                                ]
+                            },
+                            example={
+                                "conflicts": [
+                                    {
+                                        "path": "/role",
+                                        "base": {"present": True,
+                                                 "value": "analyst"},
+                                        "left": {"present": True,
+                                                 "value": "owner"},
+                                        "right": {"present": False,
+                                                 "value": None},
+                                    },
+                                    {
+                                        "path": "/tags",
+                                        "base": {"present": True,
+                                                 "value": ["a", "b"]},
+                                        "left": {"present": True,
+                                                 "value": ["a", "b", "z"]},
+                                        "right": {"present": True,
+                                                 "value": ["a", "c"]},
+                                    },
+                                ]
                             },
                         ),
                     },
